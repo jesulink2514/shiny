@@ -1,6 +1,4 @@
 ﻿using System;
-using System.Linq;
-using System.Collections.Generic;
 using System.Threading.Tasks;
 using System.Reactive.Linq;
 using System.Reactive.Subjects;
@@ -9,47 +7,56 @@ using Android.Runtime;
 using Android.Gms.Extensions;
 using Firebase.Messaging;
 using Shiny.Notifications;
-using Shiny.Infrastructure;
 using Task = System.Threading.Tasks.Task;
 using CancellationToken = System.Threading.CancellationToken;
 
 
 namespace Shiny.Push
 {
-    public class PushManager : AbstractPushManager,
-                               IPushTagSupport,
-                               IShinyStartupTask
+    public sealed class PushManager : IPushManager,
+                                      IPushTagSupport,
+                                      IShinyStartupTask
     {
         readonly Subject<PushNotification> receiveSubj;
+        readonly IServiceProvider services;
         readonly INotificationManager notificationManager;
+        readonly PushStore store;
         readonly ILogger logger;
 
 
-        public PushManager(ShinyCoreServices services,
+
+        public PushManager(IServiceProvider services,
                            INotificationManager notificationManager,
-                           ILogger<IPushManager> logger) : base(services)
+                           PushStore store,
+                           ILogger<IPushManager> logger)
         {
+            this.services = services;
             this.notificationManager = notificationManager;
             this.logger = logger;
+            this.store = store;
             this.receiveSubj = new Subject<PushNotification>();
         }
 
 
-        public virtual void Start()
+        public DateTime? CurrentRegistrationTokenDate => this.store.RegistrationTokenDate;
+        public string? CurrentRegistrationToken => this.store.RegistrationToken;
+        public string[]? RegisteredTags => this.store.Tags;
+
+
+        public void Start()
         {
             // wireup firebase if it was active
-            if (this.CurrentRegistrationToken != null)
+            if (this.store.RegistrationToken != null)
                 FirebaseMessaging.Instance.AutoInitEnabled = true;
 
             ShinyFirebaseService.NewToken = async token =>
             {
-                if (this.CurrentRegistrationToken != null)
+                if (this.store.RegistrationToken != null)
                 {
-                    this.CurrentRegistrationToken = token;
-                    this.CurrentRegistrationTokenDate = DateTime.UtcNow;
+                    this.store.RegistrationToken = token;
+                    this.store.RegistrationTokenDate = DateTime.UtcNow;
 
-                    await this.Services
-                        .Services
+                    await this.services
                         .RunDelegates<IPushDelegate>(
                             x => x.OnTokenChanged(token)
                         )
@@ -72,7 +79,7 @@ namespace Shiny.Push
         }
 
 
-        public override async Task<PushAccessState> RequestAccess(CancellationToken cancelToken = default)
+        public async Task<PushAccessState> RequestAccess(CancellationToken cancelToken = default)
         {
             var nresult = await this.notificationManager.RequestAccess();
             if (nresult != AccessState.Available)
@@ -83,60 +90,50 @@ namespace Shiny.Push
             var task = await FirebaseMessaging.Instance.GetToken();
             var token = task.JavaCast<Java.Lang.String>().ToString();
 
-            this.CurrentRegistrationToken = token;
-            this.CurrentRegistrationTokenDate = DateTime.UtcNow;
+            this.store.RegistrationToken = token;
+            this.store.RegistrationTokenDate = DateTime.UtcNow;
 
             return new PushAccessState(AccessState.Available, this.CurrentRegistrationToken);
         }
 
 
-        public override async Task UnRegister()
+        public async Task UnRegister()
         {
-            if (this.CurrentRegistrationToken == null)
-                return;
-
-            this.ClearRegistration();
-
+            this.store.Clear();
             FirebaseMessaging.Instance.AutoInitEnabled = false;
             await Task.Run(() => FirebaseMessaging.Instance.DeleteToken()).ConfigureAwait(false);
         }
 
 
-        public override IObservable<PushNotification> WhenReceived()
+        public IObservable<PushNotification> WhenReceived()
             => this.receiveSubj;
 
 
-        public virtual async Task AddTag(string tag)
+        public async Task AddTag(string tag)
         {
-            var tags = this.RegisteredTags?.ToList() ?? new List<string>(1);
-            tags.Add(tag);
-
             await FirebaseMessaging.Instance.SubscribeToTopic(tag);
-            this.RegisteredTags = tags.ToArray();
+            this.store.AddTag(tag);
         }
 
 
-        public virtual async Task RemoveTag(string tag)
+        public async Task RemoveTag(string tag)
         {
-            var list = this.RegisteredTags?.ToList() ?? new List<string>(0);
-            if (list.Remove(tag))
-                this.RegisteredTags = list.ToArray();
-
             await FirebaseMessaging.Instance.UnsubscribeFromTopic(tag);
+            this.store.RemoveTag(tag);
         }
 
 
-        public virtual async Task ClearTags()
+        public async Task ClearTags()
         {
-            if (this.RegisteredTags != null)
-                foreach (var tag in this.RegisteredTags)
+            if (this.store.Tags != null)
+                foreach (var tag in this.store.Tags)
                     await FirebaseMessaging.Instance.UnsubscribeFromTopic(tag);
 
-            this.RegisteredTags = null;
+            this.store.Tags = null;
         }
 
 
-        public virtual async Task SetTags(params string[]? tags)
+        public async Task SetTags(params string[]? tags)
         {
             await this.ClearTags();
             if (tags != null)
@@ -145,11 +142,11 @@ namespace Shiny.Push
         }
 
 
-        protected virtual async Task OnPushReceived(PushNotification push)
+        protected async Task OnPushReceived(PushNotification push)
         {
             this.receiveSubj.OnNext(push);
 
-            await this.Services.Services.RunDelegates<IPushDelegate>(
+            await this.services.RunDelegates<IPushDelegate>(
                 x => x.OnReceived(push)
             );
 
@@ -158,7 +155,7 @@ namespace Shiny.Push
         }
 
 
-        protected virtual PushNotification FromNative(RemoteMessage message)
+        public PushNotification FromNative(RemoteMessage message)
         {
             Notification? notification = null;
             var native = message.GetNotification();

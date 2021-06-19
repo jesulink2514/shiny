@@ -25,6 +25,7 @@ namespace Shiny.Push
         public override void Register(IServiceCollection services)
         {
             services.AddSingleton(typeof(IPushDelegate), this.delegateType);
+            services.TryAddSingleton<PushStore>();
             services.TryAddSingleton(typeof(IPushManager), this.pushManagerType);
 #if __IOS__ || WINDOWS_UWP
             services.UseNotifications(null, null, this.channels);
